@@ -2,215 +2,222 @@ from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, storage
 import os
+import uuid
 import logging
-import hashlib
-import time
-from datetime import datetime
-from werkzeug.utils import secure_filename
-
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import json
 
 app = Flask(__name__)
 
-# Configuración de Firebase
-try:
-    # Inicializar Firebase con credenciales desde variable de entorno
-    if not firebase_admin._apps:
-        # Usar credenciales desde variable de entorno
-        cred = credentials.ApplicationDefault()
+# Configurar logging para debug
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+def initialize_firebase():
+    """Inicializar Firebase usando variables de entorno o archivo local"""
+    try:
+        # Intentar usar variables de entorno primero (para producción)
+        firebase_credentials = os.getenv('FIREBASE_CREDENTIALS')
+        
+        if firebase_credentials:
+            # Usar credenciales desde variable de entorno (Render, Heroku, etc.)
+            logger.info("🔑 Usando credenciales de Firebase desde variable de entorno")
+            cred_dict = json.loads(firebase_credentials)
+            cred = credentials.Certificate(cred_dict)
+        else:
+            # Usar archivo local para desarrollo
+            SERVICE_ACCOUNT_PATH = "serviceAccount.json"
+            if not os.path.exists(SERVICE_ACCOUNT_PATH):
+                raise Exception(f"No se encontró {SERVICE_ACCOUNT_PATH} ni la variable FIREBASE_CREDENTIALS")
+            
+            logger.info("🔑 Usando credenciales de Firebase desde archivo local")
+            cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+        
+        # Obtener bucket desde variable de entorno o usar default
+        storage_bucket = os.getenv('FIREBASE_STORAGE_BUCKET', 'esp32cam-3db20.firebasestorage.app')
+        
         firebase_admin.initialize_app(cred, {
-            'storageBucket': 'esp32cam-3db20.firebasestorage.app'
+            "storageBucket": storage_bucket
         })
-        logger.info("🔑 Usando credenciales de Firebase desde variable de entorno")
-    
-    # Obtener bucket de Firebase Storage
-    bucket = storage.bucket()
-    logger.info(f"✅ Firebase inicializado correctamente con bucket: {bucket.name}")
+        
+        logger.info(f"✅ Firebase inicializado correctamente con bucket: {storage_bucket}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error al inicializar Firebase: {e}")
+        return False
 
-except Exception as e:
-    logger.error(f"❌ Error inicializando Firebase: {str(e)}")
-    bucket = None
+# Inicializar Firebase al arrancar la aplicación
+if not initialize_firebase():
+    logger.error("❌ No se pudo inicializar Firebase. Cerrando aplicación.")
+    exit(1)
 
-# Crear directorio uploads si no existe
-os.makedirs('uploads', exist_ok=True)
+# Carpeta temporal para archivos
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-@app.route('/')
+@app.route('/', methods=['GET'])
 def home():
+    """Endpoint de inicio"""
     return jsonify({
-        'status': 'success',
-        'message': 'ESP32-CAM Server está funcionando',
-        'firebase_status': 'connected' if bucket else 'disconnected'
-    })
+        'message': '🚀 ESP32 Cam Firebase Server',
+        'version': '1.0.0',
+        'endpoints': {
+            'GET /': 'Información del servidor',
+            'GET /test': 'Prueba del servidor',
+            'GET /test-firebase': 'Prueba de Firebase',
+            'POST /upload': 'Subir imagen',
+            'GET /list-files': 'Listar archivos'
+        }
+    }), 200
 
-@app.route('/test')
+@app.route('/test', methods=['GET'])
 def test():
-    return jsonify({
-        'status': 'ok',
-        'message': 'Servidor funcionando correctamente',
-        'timestamp': int(time.time())
-    })
+    """Endpoint de prueba para verificar que el servidor funciona"""
+    return jsonify({'message': '✅ Servidor Flask funcionando correctamente'}), 200
+
+@app.route('/test-firebase', methods=['GET'])
+def test_firebase():
+    """Endpoint para probar la conexión con Firebase"""
+    try:
+        bucket = storage.bucket()
+        logger.info(f"✅ Bucket conectado: {bucket.name}")
+        return jsonify({
+            'message': '✅ Conexión a Firebase Storage exitosa',
+            'bucket': bucket.name
+        }), 200
+    except Exception as e:
+        logger.error(f"❌ Error conectando a Firebase: {e}")
+        return jsonify({'error': f'❌ Error conectando a Firebase: {str(e)}'}), 500
 
 @app.route('/upload', methods=['POST'])
-def upload_file():
-    logger.info("📤 Iniciando proceso de carga...")
+def upload():
+    logger.info("📤 Iniciando proceso de upload...")
     
+    # Verificar que hay archivo en la petición
+    if 'photo' not in request.files:
+        logger.error("❌ No se encontró 'photo' en request.files")
+        logger.info(f"Archivos disponibles: {list(request.files.keys())}")
+        return jsonify({'error': 'No se encontró el archivo "photo" en la solicitud'}), 400
+
+    file = request.files['photo']
+    logger.info(f"📁 Archivo recibido: {file.filename}")
+    
+    # Verificar que el archivo tiene nombre
+    if file.filename == '':
+        logger.error("❌ Archivo sin nombre")
+        return jsonify({'error': 'No se seleccionó ningún archivo'}), 400
+
+    # Verificar que el archivo tiene contenido
+    if not file:
+        logger.error("❌ Archivo vacío")
+        return jsonify({'error': 'El archivo está vacío'}), 400
+
+    # Generar nombre único con timestamp
+    timestamp = int(uuid.uuid4().time_low)
+    filename = f"esp32cam_{timestamp}.jpg"
+    local_path = os.path.join(UPLOAD_FOLDER, filename)
+    
+    logger.info(f"💾 Guardando archivo como: {local_path}")
+
     try:
-        # Buscar archivo en 'photo' o 'file'
-        file = None
-        field_name = None
+        # Guardar archivo temporalmente
+        file.save(local_path)
         
-        if 'photo' in request.files:
-            file = request.files['photo']
-            field_name = 'photo'
-        elif 'file' in request.files:
-            file = request.files['file']
-            field_name = 'file'
+        # Verificar que el archivo se guardó correctamente
+        if not os.path.exists(local_path):
+            raise Exception("No se pudo guardar el archivo temporalmente")
+            
+        file_size = os.path.getsize(local_path)
+        logger.info(f"📊 Archivo guardado localmente. Tamaño: {file_size} bytes")
         
-        if not file:
-            logger.warning("⚠️ No se encontró campo 'photo' ni 'file' en la petición")
-            return jsonify({'error': 'No se encontró archivo en campos photo o file'}), 400
+        if file_size == 0:
+            raise Exception("El archivo guardado está vacío")
+
+        # Subir a Firebase Storage
+        logger.info("☁️ Subiendo a Firebase Storage...")
+        bucket = storage.bucket()
+        blob_path = f"esp32cam/{filename}"
+        blob = bucket.blob(blob_path)
         
-        # Verificar que el archivo tiene contenido
-        if file.filename == '':
-            logger.warning("⚠️ Archivo sin nombre")
-            return jsonify({'error': 'Archivo sin nombre'}), 400
+        # Subir archivo con metadata
+        blob.upload_from_filename(local_path, content_type='image/jpeg')
+        logger.info("✅ Archivo subido a Firebase Storage")
         
-        if file and allowed_file(file.filename):
-            logger.info(f"📁 Archivo recibido en campo '{field_name}': {file.filename}")
-            
-            # Generar nombre con fecha y hora
-            now = datetime.now()
-            date_str = now.strftime("%Y%m%d_%H%M%S")  # Formato: YYYYMMDD_HHMMSS
-            
-            # Agregar milisegundos para evitar duplicados
-            milliseconds = int(now.microsecond / 1000)
-            filename = f"esp32cam_{date_str}_{milliseconds:03d}.jpg"
-            
-            logger.info(f"📅 Nombre generado: {filename}")
-            
-            # Guardar archivo temporalmente
-            temp_path = os.path.join('uploads', filename)
-            file.save(temp_path)
-            logger.info(f"💾 Guardando archivo como: {temp_path}")
-            
-            # Verificar que el archivo se guardó
-            if os.path.exists(temp_path):
-                file_size = os.path.getsize(temp_path)
-                logger.info(f"📊 Archivo guardado localmente. Tamaño: {file_size} bytes")
-                
-                # Subir a Firebase Storage si está disponible
-                if bucket:
-                    try:
-                        logger.info("☁️ Subiendo a Firebase Storage...")
-                        
-                        # Crear blob en Firebase Storage
-                        blob = bucket.blob(f"esp32cam/{filename}")
-                        
-                        # Subir archivo con metadata
-                        blob.upload_from_filename(
-                            temp_path, 
-                            content_type='image/jpeg',
-                            timeout=60  # 60 segundos de timeout
-                        )
-                        
-                        # Hacer el archivo público
-                        blob.make_public()
-                        
-                        # Obtener URL pública
-                        public_url = blob.public_url
-                        logger.info(f"✅ Archivo subido a Firebase Storage")
-                        logger.info(f"🌐 URL pública: {public_url}")
-                        
-                        # Limpiar archivo temporal
-                        os.remove(temp_path)
-                        logger.info("🧹 Archivo temporal eliminado")
-                        
-                        return jsonify({
-                            'status': 'success',
-                            'message': 'Archivo subido correctamente',
-                            'filename': filename,
-                            'url': public_url,
-                            'size': file_size,
-                            'upload_date': now.strftime("%Y-%m-%d %H:%M:%S"),
-                            'field_used': field_name
-                        }), 200
-                        
-                    except Exception as firebase_error:
-                        logger.error(f"❌ Error subiendo a Firebase: {str(firebase_error)}")
-                        # Si falla Firebase, al menos confirmamos recepción
-                        return jsonify({
-                            'status': 'partial_success',
-                            'message': 'Archivo recibido pero error en Firebase',
-                            'filename': filename,
-                            'error': str(firebase_error),
-                            'upload_date': now.strftime("%Y-%m-%d %H:%M:%S"),
-                            'field_used': field_name
-                        }), 200
-                else:
-                    logger.warning("⚠️ Firebase no disponible")
-                    return jsonify({
-                        'status': 'success',
-                        'message': 'Archivo recibido (Firebase no disponible)',
-                        'filename': filename,
-                        'size': file_size,
-                        'upload_date': now.strftime("%Y-%m-%d %H:%M:%S"),
-                        'field_used': field_name
-                    }), 200
-            else:
-                logger.error("❌ Error: El archivo no se guardó correctamente")
-                return jsonify({'error': 'Error guardando archivo'}), 500
-                
-        else:
-            logger.warning("⚠️ Tipo de archivo no permitido")
-            return jsonify({'error': 'Tipo de archivo no permitido'}), 400
-            
-    except Exception as e:
-        logger.error(f"❌ Error general en upload: {str(e)}")
+        # Hacer público (opcional)
+        blob.make_public()
+        public_url = blob.public_url
+        logger.info(f"🌐 URL pública: {public_url}")
+
+        # Limpiar archivo temporal
+        os.remove(local_path)
+        logger.info("🧹 Archivo temporal eliminado")
+
         return jsonify({
-            'error': 'Error interno del servidor',
-            'details': str(e)
-        }), 500
+            'message': '✅ Imagen subida exitosamente',
+            'filename': filename,
+            'url': public_url,
+            'size': file_size,
+            'timestamp': timestamp
+        }), 200
 
-# Mantener compatibilidad con la ruta anterior
-@app.route('/carga', methods=['POST'])
-def upload_file_legacy():
-    """Ruta legacy para compatibilidad"""
-    return upload_file()
+    except Exception as e:
+        logger.error(f"❌ Error durante el upload: {str(e)}")
+        
+        # Limpiar archivo temporal si existe
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                logger.info("🧹 Archivo temporal eliminado después del error")
+            except:
+                logger.error("❌ No se pudo eliminar el archivo temporal")
+        
+        return jsonify({'error': f'❌ Error al subir imagen: {str(e)}'}), 500
 
-def allowed_file(filename):
-    """Verificar si el archivo es una imagen permitida"""
-    if not filename:
-        return False
-    
-    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+@app.route('/list-files', methods=['GET'])
+def list_files():
+    """Listar archivos en Firebase Storage"""
+    try:
+        bucket = storage.bucket()
+        blobs = bucket.list_blobs(prefix='esp32cam/')
+        
+        files = []
+        for blob in blobs:
+            files.append({
+                'name': blob.name,
+                'size': blob.size,
+                'created': blob.time_created.isoformat() if blob.time_created else None,
+                'url': f"https://storage.googleapis.com/{bucket.name}/{blob.name}"
+            })
+        
+        # Ordenar por fecha de creación (más reciente primero)
+        files.sort(key=lambda x: x['created'] or '', reverse=True)
+        
+        return jsonify({
+            'message': f'✅ {len(files)} archivos encontrados',
+            'files': files
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error listando archivos: {e}")
+        return jsonify({'error': f'❌ Error listando archivos: {str(e)}'}), 500
 
-@app.route('/health')
-def health_check():
-    """Endpoint para verificar el estado del servidor"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': int(time.time()),
-        'firebase_connected': bucket is not None,
-        'current_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-
-@app.errorhandler(413)
-def too_large(e):
-    logger.warning("⚠️ Archivo demasiado grande")
-    return jsonify({'error': 'Archivo demasiado grande'}), 413
-
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"❌ Error interno: {str(e)}")
-    return jsonify({'error': 'Error interno del servidor'}), 500
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check para servicios de hosting"""
+    return jsonify({'status': 'healthy', 'timestamp': uuid.uuid4().time_low}), 200
 
 if __name__ == '__main__':
-    # Configurar límite de subida (16MB)
-    app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+    port = int(os.getenv('PORT', 5000))
+    debug_mode = os.getenv('FLASK_ENV') == 'development'
     
-    # Ejecutar en modo debug para desarrollo
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    logger.info("🚀 Iniciando servidor Flask...")
+    logger.info("📍 Endpoints disponibles:")
+    logger.info("  GET  / - Información del servidor")
+    logger.info("  GET  /test - Prueba del servidor")
+    logger.info("  GET  /test-firebase - Prueba de Firebase")
+    logger.info("  POST /upload - Subir imagen")
+    logger.info("  GET  /list-files - Listar archivos")
+    logger.info("  GET  /health - Health check")
+    logger.info(f"🔧 Puerto: {port}, Debug: {debug_mode}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
