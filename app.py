@@ -5,6 +5,7 @@ import os
 import logging
 import hashlib
 import time
+from datetime import datetime
 from werkzeug.utils import secure_filename
 
 # Configurar logging
@@ -51,17 +52,25 @@ def test():
         'timestamp': int(time.time())
     })
 
-@app.route('/carga', methods=['POST'])
+@app.route('/upload', methods=['POST'])
 def upload_file():
     logger.info("📤 Iniciando proceso de carga...")
     
     try:
-        # Verificar que hay archivos en la petición
-        if 'file' not in request.files:
-            logger.warning("⚠️ No se encontró campo 'file' en la petición")
-            return jsonify({'error': 'No se encontró archivo'}), 400
+        # Buscar archivo en 'photo' o 'file'
+        file = None
+        field_name = None
         
-        file = request.files['file']
+        if 'photo' in request.files:
+            file = request.files['photo']
+            field_name = 'photo'
+        elif 'file' in request.files:
+            file = request.files['file']
+            field_name = 'file'
+        
+        if not file:
+            logger.warning("⚠️ No se encontró campo 'photo' ni 'file' en la petición")
+            return jsonify({'error': 'No se encontró archivo en campos photo o file'}), 400
         
         # Verificar que el archivo tiene contenido
         if file.filename == '':
@@ -69,12 +78,17 @@ def upload_file():
             return jsonify({'error': 'Archivo sin nombre'}), 400
         
         if file and allowed_file(file.filename):
-            logger.info(f"📁 Archivo recibido: {file.filename}")
+            logger.info(f"📁 Archivo recibido en campo '{field_name}': {file.filename}")
             
-            # Generar nombre único
-            timestamp = int(time.time() * 1000)  # milisegundos
-            random_hash = hashlib.md5(str(timestamp).encode()).hexdigest()[:8]
-            filename = f"esp32cam_{random_hash}.jpg"
+            # Generar nombre con fecha y hora
+            now = datetime.now()
+            date_str = now.strftime("%Y%m%d_%H%M%S")  # Formato: YYYYMMDD_HHMMSS
+            
+            # Agregar milisegundos para evitar duplicados
+            milliseconds = int(now.microsecond / 1000)
+            filename = f"esp32cam_{date_str}_{milliseconds:03d}.jpg"
+            
+            logger.info(f"📅 Nombre generado: {filename}")
             
             # Guardar archivo temporalmente
             temp_path = os.path.join('uploads', filename)
@@ -118,7 +132,9 @@ def upload_file():
                             'message': 'Archivo subido correctamente',
                             'filename': filename,
                             'url': public_url,
-                            'size': file_size
+                            'size': file_size,
+                            'upload_date': now.strftime("%Y-%m-%d %H:%M:%S"),
+                            'field_used': field_name
                         }), 200
                         
                     except Exception as firebase_error:
@@ -128,7 +144,9 @@ def upload_file():
                             'status': 'partial_success',
                             'message': 'Archivo recibido pero error en Firebase',
                             'filename': filename,
-                            'error': str(firebase_error)
+                            'error': str(firebase_error),
+                            'upload_date': now.strftime("%Y-%m-%d %H:%M:%S"),
+                            'field_used': field_name
                         }), 200
                 else:
                     logger.warning("⚠️ Firebase no disponible")
@@ -136,7 +154,9 @@ def upload_file():
                         'status': 'success',
                         'message': 'Archivo recibido (Firebase no disponible)',
                         'filename': filename,
-                        'size': file_size
+                        'size': file_size,
+                        'upload_date': now.strftime("%Y-%m-%d %H:%M:%S"),
+                        'field_used': field_name
                     }), 200
             else:
                 logger.error("❌ Error: El archivo no se guardó correctamente")
@@ -153,6 +173,12 @@ def upload_file():
             'details': str(e)
         }), 500
 
+# Mantener compatibilidad con la ruta anterior
+@app.route('/carga', methods=['POST'])
+def upload_file_legacy():
+    """Ruta legacy para compatibilidad"""
+    return upload_file()
+
 def allowed_file(filename):
     """Verificar si el archivo es una imagen permitida"""
     if not filename:
@@ -168,7 +194,8 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': int(time.time()),
-        'firebase_connected': bucket is not None
+        'firebase_connected': bucket is not None,
+        'current_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
 @app.errorhandler(413)
